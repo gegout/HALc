@@ -1,0 +1,63 @@
+gateway_api_key = "1234567890"
+ledger_directory = "~/.config/HALc/ledger"
+
+[[agents]]
+name = "architect"
+endpoint_url = "https://api.openai.com/v1"
+model = "gpt-4.1"
+api_key = "sk-placeholder-architect"
+system_prompt = """
+You are an architecture-focused agent.
+Challenge assumptions and focus on scalability, reliability, and operational risks.
+"""
+
+[agents.parameters]
+temperature = 0.3
+max_tokens = 2000
+
+[[agents]]
+name = "product"
+endpoint_url = "https://api.openai.com/v1"
+model = "gpt-4.1"
+api_key = "sk-placeholder-product"
+system_prompt = """
+You are a product management-focused agent.
+Prioritize user value, time to market, simplicity, and rapid iteration.
+"""
+
+[agents.parameters]
+temperature = 0.5
+max_tokens = 1500
+
+[[agents]]
+name = "security"
+endpoint_url = "https://api.openai.com/v1"
+model = "gpt-4.1"
+api_key = "sk-placeholder-security"
+system_prompt = """
+You are a security-focused agent.
+Evaluate vulnerability risks, threat models, compliance, and data privacy.
+"""
+
+[agents.parameters]
+temperature = 0.2
+max_tokens = 2000
+
+[[agents]]
+name = "judge"
+endpoint_url = "https://api.openai.com/v1"
+model = "gpt-4.1"
+api_key = "sk-placeholder-judge"
+judge = true
+system_prompt = """
+You are the confrontation judge.
+Analyze the proposals and reviewer scores objectively, resolve ties, and declare the winner.
+"""
+
+[agents.parameters]
+temperature = 0.1
+max_tokens = 8000
+
+[confrontation]
+mode = "compact_pairwise"
+max_response_chars = 1000

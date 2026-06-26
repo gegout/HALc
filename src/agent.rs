@@ -1,0 +1,768 @@
+// MIT License
+//
+// Copyright (c) 2026 Cedric Gegout
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+use crate::config::{AgentConfig, NormalizationConfig, Verbosity};
+use crate::context::AgentContextStore;
+use crate::error::{HalcError, Result};
+use crate::markdown::MarkdownDocument;
+use crate::openai::ChatCompletionMessage;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tracing::{error, info, warn};
+
+/// Default HTTP request timeout for LLM client queries.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+// --- Core Stage Structures ---
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct Synthesis {
+    pub agent: String,
+    pub problem_statement: String,
+    pub priorities_used: Vec<String>,
+    pub constraints: Vec<String>,
+    pub success_metrics: Vec<String>,
+    pub proposal: String,
+    pub rationale: String,
+    pub claims: Vec<String>,
+    pub assumptions: Vec<String>,
+    pub risks: Vec<String>,
+    pub evidence: Vec<String>,
+    pub expected_outcomes: Vec<String>,
+    pub raw_markdown: String,
+}
+
+impl Synthesis {
+    pub fn parse_markdown(
+        doc: &MarkdownDocument,
+        norm: &NormalizationConfig,
+        agent_name: &str,
+        raw_markdown: String,
+    ) -> Self {
+        Self {
+            agent: agent_name.to_string(),
+            problem_statement: doc
+                .get_section(&norm.problem_statement)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            priorities_used: doc.get_list(&norm.priorities_used),
+            constraints: doc.get_list(&norm.constraints),
+            success_metrics: doc.get_list(&norm.success_metrics),
+            proposal: doc
+                .get_section(&norm.proposal)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            rationale: doc
+                .get_section(&norm.rationale)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            claims: doc.get_list(&norm.claims),
+            assumptions: doc.get_list(&norm.assumptions),
+            risks: doc.get_list(&norm.risks),
+            evidence: doc.get_list(&norm.evidence),
+            expected_outcomes: doc.get_list(&norm.expected_outcomes),
+            raw_markdown,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct PairwiseComparison {
+    pub reviewer: String,
+    pub winner: String,
+    pub loser: String,
+    pub confidence: i32,
+    pub priority_alignment: String,
+    pub reasoning: String,
+    pub risks_in_loser: Vec<String>,
+    pub risks_in_winner: Vec<String>,
+    pub raw_markdown: String,
+}
+
+impl PairwiseComparison {
+    pub fn parse_markdown(
+        doc: &MarkdownDocument,
+        norm: &NormalizationConfig,
+        reviewer_name: &str,
+        raw_markdown: String,
+    ) -> Self {
+        let confidence = doc.get_integer(&norm.confidence).unwrap_or(0).clamp(0, 10);
+        Self {
+            reviewer: reviewer_name.to_string(),
+            winner: doc
+                .get_section(&norm.winning_agent)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            loser: doc
+                .get_section(&norm.loser)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            confidence,
+            priority_alignment: doc
+                .get_section(&norm.priority_alignment)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            reasoning: doc
+                .get_section(&norm.reasoning)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            risks_in_loser: doc.get_list(&norm.risks_in_loser),
+            risks_in_winner: doc.get_list(&norm.risks_in_winner),
+            raw_markdown,
+        }
+    }
+}
+
+/// Stage 1: Framing details generated by each agent.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ProblemFrame {
+    /// Statement clarifying what needs to be solved.
+    pub problem_statement: String,
+
+    /// Hard constraints/limits imposed by the context.
+    pub constraints: Vec<String>,
+
+    /// Metrics indicating success.
+    pub success_metrics: Vec<String>,
+
+    /// Stated timeline or deadline.
+    pub deadline: String,
+
+    /// Under-the-hood assumptions.
+    pub clarifying_assumptions: Vec<String>,
+}
+
+impl ProblemFrame {
+    pub fn parse_markdown(doc: &MarkdownDocument, norm: &NormalizationConfig) -> Self {
+        Self {
+            problem_statement: doc
+                .get_section(&norm.problem_statement)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            constraints: doc.get_list(&norm.constraints),
+            success_metrics: doc.get_list(&norm.success_metrics),
+            deadline: doc
+                .get_section(&norm.deadline)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            clarifying_assumptions: doc.get_list(&norm.clarifying_assumptions),
+        }
+    }
+}
+
+/// Stage 2: Proposal details submitted by each agent.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct Proposal {
+    /// Submitting agent name.
+    pub agent: String,
+
+    /// High-level text proposal.
+    pub proposal: String,
+
+    /// Reason why this proposal is recommended.
+    pub rationale: String,
+
+    /// Projected benefits of implementation.
+    pub expected_benefits: Vec<String>,
+
+    /// Known downsides or operational risks.
+    pub known_risks: Vec<String>,
+}
+
+impl Proposal {
+    pub fn parse_markdown(
+        doc: &MarkdownDocument,
+        norm: &NormalizationConfig,
+        agent_name: &str,
+    ) -> Self {
+        let mut proposal = doc
+            .get_section(&norm.proposal)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        if proposal.is_empty() {
+            if let Some(intro) = doc.sections.get("introduction") {
+                if !intro.trim().is_empty() {
+                    proposal = intro.trim().to_string();
+                }
+            }
+        }
+
+        if proposal.is_empty() {
+            // Find any non-empty section that isn't already expected_benefits, known_risks, or rationale
+            for (key, val) in &doc.sections {
+                let k_lower = key.to_lowercase();
+                let is_rationale = norm.rationale.iter().any(|r| r.to_lowercase() == k_lower);
+                let is_benefits = norm
+                    .expected_benefits
+                    .iter()
+                    .any(|b| b.to_lowercase() == k_lower);
+                let is_risks = norm.known_risks.iter().any(|r| r.to_lowercase() == k_lower);
+                if !is_rationale
+                    && !is_benefits
+                    && !is_risks
+                    && k_lower != "introduction"
+                    && !val.trim().is_empty()
+                {
+                    proposal = val.trim().to_string();
+                    break;
+                }
+            }
+        }
+
+        // Final absolute fallback: if still empty, pick the first non-empty section of any kind
+        if proposal.is_empty() {
+            for val in doc.sections.values() {
+                if !val.trim().is_empty() {
+                    proposal = val.trim().to_string();
+                    break;
+                }
+            }
+        }
+
+        Self {
+            agent: agent_name.to_string(),
+            proposal,
+            rationale: doc
+                .get_section(&norm.rationale)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            expected_benefits: doc.get_list(&norm.expected_benefits),
+            known_risks: doc.get_list(&norm.known_risks),
+        }
+    }
+}
+
+/// Stage 3: Deconstructed assumptions from each proposal.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ProposalAnalysis {
+    /// Proposing agent name.
+    pub agent: String,
+
+    /// Individual claims made in the proposal.
+    pub claims: Vec<String>,
+
+    /// Core assumptions validating the claims.
+    pub assumptions: Vec<String>,
+
+    /// Key technical/process risks.
+    pub risks: Vec<String>,
+
+    /// Supporting evidence justifying the proposal.
+    pub evidence: Vec<String>,
+
+    /// Targeted operational outcomes.
+    pub expected_outcomes: Vec<String>,
+}
+
+impl ProposalAnalysis {
+    pub fn parse_markdown(
+        doc: &MarkdownDocument,
+        norm: &NormalizationConfig,
+        agent_name: &str,
+    ) -> Self {
+        Self {
+            agent: agent_name.to_string(),
+            claims: doc.get_list(&norm.claims),
+            assumptions: doc.get_list(&norm.assumptions),
+            risks: doc.get_list(&norm.risks),
+            evidence: doc.get_list(&norm.evidence),
+            expected_outcomes: doc.get_list(&norm.expected_outcomes),
+        }
+    }
+}
+
+/// Stage 4: Evaluation details submitted when challenging another agent.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct Challenge {
+    /// Reviewer agent identifier.
+    pub reviewer_agent: String,
+
+    /// Target agent identifier.
+    pub target_agent: String,
+
+    /// High-level critique message.
+    pub challenge: String,
+
+    /// Stated strengths of the proposal.
+    pub strengths: Vec<String>,
+
+    /// Stated weaknesses of the proposal.
+    pub weaknesses: Vec<String>,
+
+    /// Missing proof or logic gaps.
+    pub missing_evidence: Vec<String>,
+
+    /// Risk profile evaluation message.
+    pub risk_assessment: String,
+
+    /// Numeric score assigned (0 to 10).
+    pub score: i32,
+}
+
+impl Challenge {
+    pub fn parse_markdown(
+        doc: &MarkdownDocument,
+        norm: &NormalizationConfig,
+        reviewer: &str,
+        target: &str,
+    ) -> Self {
+        Self {
+            reviewer_agent: reviewer.to_string(),
+            target_agent: target.to_string(),
+            challenge: doc
+                .get_section(&norm.challenge)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            strengths: doc.get_list(&norm.strengths),
+            weaknesses: doc.get_list(&norm.weaknesses),
+            missing_evidence: doc.get_list(&norm.missing_evidence),
+            risk_assessment: doc
+                .get_section(&norm.risk_assessment)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            score: doc.get_integer(&norm.score).unwrap_or(0),
+        }
+    }
+}
+
+/// Stage 7: Context revision returned during Steelman process.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct SteelmanUpdate {
+    /// Target agent name.
+    pub agent: String,
+
+    /// Summarized, revised context.
+    pub new_context: String,
+}
+
+impl SteelmanUpdate {
+    pub fn parse_markdown(raw_md: &str, agent_name: &str) -> Self {
+        Self {
+            agent: agent_name.to_string(),
+            new_context: raw_md.trim().to_string(),
+        }
+    }
+}
+
+// --- Agent Client & Runtime ---
+
+/// Evaluator wrapper holding configuration, context reference, and a reqwest HTTP client.
+#[derive(Debug, Clone)]
+pub struct AgentRuntime {
+    /// Configuration variables loaded from TOML.
+    pub config: AgentConfig,
+
+    /// Reference to in-memory context store.
+    pub context_store: AgentContextStore,
+
+    client: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponseChoice {
+    message: ChatCompletionMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponse {
+    choices: Vec<OpenAIResponseChoice>,
+}
+
+impl AgentRuntime {
+    /// Constructs a new agent client interface runtime.
+    pub fn new(config: AgentConfig, context_store: AgentContextStore) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .unwrap_or_default();
+        Self {
+            config,
+            context_store,
+            client,
+        }
+    }
+
+    /// Cleans and extracts raw JSON from chat response output strings,
+    /// removing markdown wrappers (` ```json ` ... ` ``` `) and pre/post message chatter.
+    pub fn extract_json(s: &str) -> String {
+        let mut cleaned = s.trim();
+
+        // Remove markdown wrappers if any
+        if cleaned.starts_with("```") {
+            if let Some(first_newline) = cleaned.find('\n') {
+                cleaned = &cleaned[first_newline..];
+            }
+            if cleaned.ends_with("```") {
+                cleaned = &cleaned[..cleaned.len() - 3];
+            }
+            cleaned = cleaned.trim();
+        }
+
+        // Find outer-most curly braces
+        if let (Some(start), Some(end)) = (cleaned.find('{'), cleaned.rfind('}')) {
+            if start <= end {
+                return cleaned[start..=end].to_string();
+            }
+        }
+
+        cleaned.to_string()
+    }
+
+    /// Parses error strings to find suggested parameter replacements (e.g. "Use max_completion_tokens instead").
+    pub fn find_suggested_parameter(err_text: &str) -> Option<String> {
+        let err_lower = err_text.to_lowercase();
+        if let Some(use_idx) = err_lower.find("use ") {
+            let sub = &err_text[use_idx + 4..];
+            let sub_lower = &err_lower[use_idx + 4..];
+            if let Some(instead_idx) = sub_lower.find("instead") {
+                let candidate = &sub[..instead_idx];
+                let cleaned = candidate.trim_matches(|c: char| {
+                    c.is_whitespace() || c == '\'' || c == '"' || c == '`' || c == '.'
+                });
+                if !cleaned.is_empty()
+                    && cleaned
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                {
+                    return Some(cleaned.to_string());
+                }
+            }
+
+            let words: Vec<&str> = sub.split_whitespace().collect();
+            for word in words.iter().take(3) {
+                let cleaned = word.trim_matches(|c: char| {
+                    c.is_whitespace()
+                        || c == '\''
+                        || c == '"'
+                        || c == '`'
+                        || c == ','
+                        || c == '.'
+                        || c == ':'
+                });
+                if !cleaned.is_empty()
+                    && cleaned
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                {
+                    let cleaned_lower = cleaned.to_lowercase();
+                    if cleaned_lower != "the"
+                        && cleaned_lower != "a"
+                        && cleaned_lower != "parameter"
+                        && cleaned_lower != "model"
+                        && cleaned_lower != "this"
+                        && cleaned_lower != "instead"
+                    {
+                        return Some(cleaned.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Performs a post request to the endpoint's completions URL, with dynamic fallbacks if some parameters are unsupported.
+    pub async fn call_endpoint(
+        &self,
+        messages: Vec<ChatCompletionMessage>,
+        verbosity: Verbosity,
+    ) -> Result<String> {
+        let url = format!(
+            "{}/chat/completions",
+            self.config.endpoint_url.trim_end_matches('/')
+        );
+
+        let mut payload_params = serde_json::Map::new();
+        for (k, v) in &self.config.parameters {
+            payload_params.insert(k.clone(), v.clone());
+        }
+
+        let mut attempts = 0;
+        let max_attempts = 3;
+
+        loop {
+            attempts += 1;
+
+            let mut payload = serde_json::json!({
+                "model": self.config.model.clone(),
+                "messages": messages,
+            });
+
+            if let serde_json::Value::Object(ref mut map) = payload {
+                for (k, v) in &payload_params {
+                    map.insert(k.clone(), v.clone());
+                }
+            }
+
+            if verbosity == Verbosity::Debug {
+                info!(
+                    "Agent '{}' Request Payload to model '{}': {}",
+                    self.config.name,
+                    self.config.model,
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else if verbosity == Verbosity::Verbose {
+                info!(
+                    "Calling agent '{}' at model '{}' (attempt {}/{})...",
+                    self.config.name, self.config.model, attempts, max_attempts
+                );
+            }
+
+            let mut req = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .json(&payload);
+
+            if url.contains("openrouter.ai") {
+                req = req
+                    .header("HTTP-Referer", "https://github.com/cgegout/HALc")
+                    .header("X-Title", "HALc");
+            }
+
+            let response = req.send().await?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_text = response.text().await.unwrap_or_default();
+
+                if attempts < max_attempts
+                    && (status == reqwest::StatusCode::BAD_REQUEST
+                        || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY)
+                {
+                    let err_json: Option<serde_json::Value> = serde_json::from_str(&err_text).ok();
+                    let param_name = err_json
+                        .as_ref()
+                        .and_then(|j| j.get("error"))
+                        .and_then(|e| e.get("param"))
+                        .and_then(|p| p.as_str())
+                        .map(|s| s.to_string());
+
+                    let mut rejected_param = param_name;
+
+                    if rejected_param.is_none() {
+                        let err_lower = err_text.to_lowercase();
+                        for key in payload_params.keys() {
+                            if err_lower.contains(&key.to_lowercase()) {
+                                rejected_param = Some(key.clone());
+                                break;
+                            }
+                        }
+                    }
+
+                    let mut adjusted = false;
+
+                    if let Some(rejected) = rejected_param {
+                        if payload_params.contains_key(&rejected) {
+                            let val_opt = payload_params.remove(&rejected);
+                            if let Some(new_param) = Self::find_suggested_parameter(&err_text) {
+                                if let Some(val) = val_opt {
+                                    payload_params.insert(new_param.clone(), val);
+                                    warn!(
+                                        "Agent '{}' model '{}' rejected '{}', swapped to '{}' as suggested by endpoint",
+                                        self.config.name, self.config.model, rejected, new_param
+                                    );
+                                    adjusted = true;
+                                }
+                            } else {
+                                warn!(
+                                    "Agent '{}' model '{}' rejected '{}', removed it",
+                                    self.config.name, self.config.model, rejected
+                                );
+                                adjusted = true;
+                            }
+                        }
+                    }
+
+                    if adjusted {
+                        continue;
+                    }
+                }
+
+                error!(
+                    "Agent '{}' HTTP error: {} - {}",
+                    self.config.name, status, err_text
+                );
+                return Err(HalcError::OpenAiApi(format!(
+                    "HTTP error {}: {}",
+                    status, err_text
+                )));
+            }
+
+            let resp_text = response.text().await?;
+            if verbosity == Verbosity::Debug {
+                info!("Agent '{}' Response Body: {}", self.config.name, resp_text);
+            }
+
+            let resp_json: OpenAIResponse = match serde_json::from_str(&resp_text) {
+                Ok(j) => j,
+                Err(e) => {
+                    error!(
+                        "Failed to deserialize agent response JSON: {:?}. Raw response: {}",
+                        e, resp_text
+                    );
+                    return Err(HalcError::OpenAiApi(format!(
+                        "Deserialization error: {:?}. Raw response: {}",
+                        e, resp_text
+                    )));
+                }
+            };
+            if resp_json.choices.is_empty() {
+                return Err(HalcError::OpenAiApi(
+                    "Empty choices array returned by agent API".to_string(),
+                ));
+            }
+
+            let content = resp_json.choices[0].message.content.clone();
+            if content.is_empty() {
+                warn!(
+                    "Agent '{}' returned empty completion content. Raw response: {}",
+                    self.config.name, resp_text
+                );
+            }
+            return Ok(content);
+        }
+    }
+
+    /// Queries the client for a structured JSON response, executing a single retry with stricter guidelines on failures.
+    pub async fn query_json<T>(
+        &self,
+        base_messages: Vec<ChatCompletionMessage>,
+        strict_prompt: &str,
+    ) -> Result<T>
+    where
+        for<'de> T: Deserialize<'de> + Serialize,
+    {
+        // 1. Initial attempt
+        let mut attempt_messages = base_messages.clone();
+        let initial_response = match self
+            .call_endpoint(attempt_messages.clone(), Verbosity::Normal)
+            .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                warn!(
+                    "Initial call to agent '{}' failed: {:?}",
+                    self.config.name, e
+                );
+                return Err(e);
+            }
+        };
+
+        let cleaned = Self::extract_json(&initial_response);
+        match serde_json::from_str::<T>(&cleaned) {
+            Ok(parsed) => return Ok(parsed),
+            Err(err) => {
+                warn!(
+                    "JSON validation failed for agent '{}' on first try: {:?}. Retrying...",
+                    self.config.name, err
+                );
+                info!("Failed JSON content: {}", cleaned);
+            }
+        }
+
+        // 2. Retry with stricter instructions
+        attempt_messages.push(ChatCompletionMessage {
+            role: "assistant".to_string(),
+            content: initial_response,
+        });
+        attempt_messages.push(ChatCompletionMessage {
+            role: "user".to_string(),
+            content: strict_prompt.to_string(),
+        });
+
+        let retry_response = self
+            .call_endpoint(attempt_messages, Verbosity::Normal)
+            .await?;
+        let cleaned_retry = Self::extract_json(&retry_response);
+        match serde_json::from_str::<T>(&cleaned_retry) {
+            Ok(parsed) => Ok(parsed),
+            Err(err) => {
+                error!(
+                    "JSON validation failed for agent '{}' on second try: {:?}",
+                    self.config.name, err
+                );
+                Err(HalcError::Json(err))
+            }
+        }
+    }
+
+    /// Queries the client for a raw Markdown response.
+    pub async fn query_markdown(
+        &self,
+        messages: Vec<ChatCompletionMessage>,
+        verbosity: Verbosity,
+    ) -> Result<String> {
+        self.call_endpoint(messages, verbosity).await
+    }
+
+    /// Performs the initial shared context load check with the agent.
+    ///
+    /// `template` is the content of `context_init.md` with `{{initial_context}}` placeholder.
+    pub async fn initialize_context(
+        &self,
+        initial_context: &str,
+        template: &str,
+        verbosity: Verbosity,
+    ) -> Result<()> {
+        let user_content =
+            crate::prompts::render(template, &[("initial_context", initial_context)]);
+        let messages = vec![
+            ChatCompletionMessage {
+                role: "system".to_string(),
+                content: self.config.system_prompt.clone(),
+            },
+            ChatCompletionMessage {
+                role: "user".to_string(),
+                content: user_content,
+            },
+        ];
+
+        let response = self.call_endpoint(messages, verbosity).await?;
+        if verbosity >= Verbosity::Verbose {
+            info!(
+                "Initialization response from agent '{}': {}",
+                self.config.name,
+                response.trim()
+            );
+        }
+
+        // Store context in memory
+        self.context_store
+            .set(self.config.name.clone(), initial_context.to_string())
+            .await;
+        Ok(())
+    }
+}
