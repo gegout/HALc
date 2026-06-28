@@ -7,7 +7,7 @@ HALc is a Rust application implementing a constructive confrontation algorithm b
 ## Academic Context & Literature Comparison
 
 For a detailed theoretical background, academic context, and comparison with existing literature on multi-agent consensus and negotiation frameworks, please refer to the following documents:
-* **HTML Version**: [Heuristic Agent Ledger by confrontation (HTML)](file:///home/cgegout/Documents/Antigravity/HALc/Heuristic%20Agent%20Ledger%20by%20confrontation/HeuristicAgentLedgerbyconfrontation.html)
+* **Markdown Version**: [Heuristic Agent Ledger by confrontation (Markdown)](file:///home/cgegout/Documents/Antigravity/HALc/Heuristic%20Agent%20Ledger%20by%20confrontation/Heuristic%20Agent%20Ledger%20by%20confrontation.md)
 * **PDF Version**: [Heuristic Agent Ledger by confrontation (PDF)](file:///home/cgegout/Documents/Antigravity/HALc/Heuristic%20Agent%20Ledger%20by%20confrontation/Heuristic%20Agent%20Ledger%20by%20confrontation_v1_2026_06_28.pdf)
 
 ---
